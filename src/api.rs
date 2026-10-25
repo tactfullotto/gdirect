@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -60,25 +61,102 @@ impl File {
             )
     }
 }
+fn client_for(ip: Option<IpAddr>, forged: Option<&str>) -> Result<Client> {
+    let mut builder = client_builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(8))
+        .timeout(Duration::from_secs(30));
+    if let Some(ip) = ip {
+        builder = builder.resolve(forged.unwrap_or(API_HOST), SocketAddr::new(ip, 443));
+    }
+    Ok(builder.build()?)
+}
+/// Request URL for `path` under the current TLS identity.
+pub(crate) fn url_for(forged: Option<&str>, path: &str) -> String {
+    format!("https://{}/drive/v3/{path}", forged.unwrap_or(API_HOST))
+}
+/// Rewrites a validated Google URL for the forged identity: the connection
+/// and certificate name become `forged`, only the Host header stays real.
+pub(crate) fn gate(forged: Option<&str>, url: &url::Url) -> url::Url {
+    let mut url = url.clone();
+    if let Some(host) = forged {
+        let _ = url.set_host(Some(host));
+    }
+    url
+}
+struct Live {
+    client: Client,
+    forged: Option<String>,
+}
 #[derive(Clone)]
 pub struct Api {
-    pub(crate) client: Client,
     pub db: PathBuf,
+    ip: Option<IpAddr>,
+    /// False once the user picks --sni/--no-sni explicitly: no quiet fallback.
+    auto: bool,
+    live: Arc<Mutex<Live>>,
 }
 impl Api {
-    pub fn new(db: PathBuf, ip: Option<IpAddr>) -> Result<Self> {
-        let mut builder = client_builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(8))
-            .timeout(Duration::from_secs(30));
-        if let Some(ip) = ip {
-            builder = builder.resolve(API_HOST, SocketAddr::new(ip, 443));
-        }
+    pub fn new(
+        db: PathBuf,
+        ip: Option<IpAddr>,
+        forged: Option<String>,
+        auto: bool,
+    ) -> Result<Self> {
+        ensure!(
+            forged.as_deref() != Some(""),
+            "--no-sni applies to downloads; Drive API requests need an SNI name"
+        );
         Ok(Self {
-            client: builder.build()?,
+            live: Arc::new(Mutex::new(Live {
+                client: client_for(ip, forged.as_deref())?,
+                forged,
+            })),
             db,
+            ip,
+            auto,
         })
+    }
+    /// Sends one request; on a connect/timeout failure the request is retried
+    /// once under the other TLS identity (real <-> forged g.cn). A successful
+    /// fallback is kept for this process and persisted on the endpoint.
+    pub(crate) fn deliver(
+        &self,
+        build: impl Fn(&Client, Option<&str>) -> reqwest::blocking::RequestBuilder,
+    ) -> Result<reqwest::blocking::Response> {
+        let (client, forged) = {
+            let live = self.live.lock().unwrap();
+            (live.client.clone(), live.forged.clone())
+        };
+        let send = |client: &Client, forged: Option<&str>| {
+            build(client, forged)
+                .header(reqwest::header::HOST, API_HOST)
+                .send()
+                .map_err(|e| e.without_url())
+        };
+        match send(&client, forged.as_deref()) {
+            Err(error)
+                if self.auto && self.ip.is_some() && (error.is_connect() || error.is_timeout()) =>
+            {
+                let ip = self.ip.unwrap();
+                let alt_forged = match &forged {
+                    Some(_) => None,
+                    None => Some(FORGED_HOST.to_owned()),
+                };
+                let alt = client_for(Some(ip), alt_forged.as_deref())?;
+                let response = send(&alt, alt_forged.as_deref())?;
+                *self.live.lock().unwrap() = Live {
+                    client: alt,
+                    forged: alt_forged.clone(),
+                };
+                if let Ok(db) = Store::open(&self.db) {
+                    let _ = db.set_sni(&ip.to_string(), alt_forged.as_deref().unwrap_or_default());
+                }
+                Ok(response)
+            }
+            result => Ok(result?),
+        }
     }
     pub fn token(&self) -> Result<String> {
         if let Ok(token) = std::env::var("GDIRECT_ACCESS_TOKEN") {
@@ -109,13 +187,12 @@ impl Api {
         Ok(token.access_token)
     }
     fn account_for_token(&self, token: &str) -> Result<String> {
-        let response = self
-            .client
-            .get("https://www.googleapis.com/drive/v3/about")
-            .query(&[("fields", "user(emailAddress)")])
-            .bearer_auth(token)
-            .send()
-            .map_err(|e| e.without_url())?;
+        let response = self.deliver(|client, forged| {
+            client
+                .get(url_for(forged, "about"))
+                .query(&[("fields", "user(emailAddress)")])
+                .bearer_auth(token)
+        })?;
         let data = checked(response)?;
         Ok(data["user"]["emailAddress"]
             .as_str()
@@ -152,23 +229,23 @@ impl Api {
         query: &[(String, String)],
         body: Option<&serde_json::Value>,
     ) -> Result<serde_json::Value> {
-        let url = format!("https://www.googleapis.com/drive/v3/{path}");
-        let send = |token: String| {
-            let mut request = self
-                .client
-                .request(method.clone(), &url)
+        let build = |client: &Client, forged: Option<&str>, token: &str| {
+            let mut request = client
+                .request(method.clone(), url_for(forged, path))
                 .query(query)
                 .bearer_auth(token);
             if let Some(body) = body {
                 request = request.json(body);
             }
-            request.send().map_err(|e| e.without_url())
+            request
         };
-        let mut response = send(self.token()?)?;
+        let token = self.token()?;
+        let mut response = self.deliver(|client, forged| build(client, forged, &token))?;
         if response.status() == reqwest::StatusCode::UNAUTHORIZED
             && std::env::var_os("GDIRECT_ACCESS_TOKEN").is_none()
         {
-            response = send(self.refresh()?)?;
+            let token = self.refresh()?;
+            response = self.deliver(|client, forged| build(client, forged, &token))?;
         }
         checked(response)
     }

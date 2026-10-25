@@ -84,14 +84,14 @@ impl Api {
         let mut start = 0;
         let mut session = saved.filter(|s| s.size == size && s.modified == modified);
         if let Some(s) = &session {
-            let response = self
-                .client
-                .put(session_url(&s.url)?)
-                .bearer_auth(&token)
-                .header("Content-Range", format!("bytes */{size}"))
-                .header("Content-Length", 0)
-                .send()
-                .map_err(|e| e.without_url())?;
+            let url = session_url(&s.url)?;
+            let response = self.deliver(|client, forged| {
+                client
+                    .put(crate::api::gate(forged, &url))
+                    .bearer_auth(&token)
+                    .header("Content-Range", format!("bytes */{size}"))
+                    .header("Content-Length", 0)
+            })?;
             match response.status() {
                 StatusCode::OK | StatusCode::CREATED => {
                     let result = response.json()?;
@@ -106,20 +106,19 @@ impl Api {
         let session = match session {
             Some(s) => s,
             None => {
-                let response = self
-                    .client
-                    .post("https://www.googleapis.com/upload/drive/v3/files")
-                    .query(&[
-                        ("uploadType", "resumable"),
-                        ("supportsAllDrives", "true"),
-                        ("fields", FIELDS),
-                    ])
-                    .bearer_auth(&token)
-                    .header("X-Upload-Content-Type", "application/octet-stream")
-                    .header("X-Upload-Content-Length", size)
-                    .json(&serde_json::json!({"name": name, "parents": [parent]}))
-                    .send()
-                    .map_err(|e| e.without_url())?;
+                let response = self.deliver(|client, forged| {
+                    client
+                        .post(crate::api::url_for(forged, "upload/drive/v3/files"))
+                        .query(&[
+                            ("uploadType", "resumable"),
+                            ("supportsAllDrives", "true"),
+                            ("fields", FIELDS),
+                        ])
+                        .bearer_auth(&token)
+                        .header("X-Upload-Content-Type", "application/octet-stream")
+                        .header("X-Upload-Content-Length", size)
+                        .json(&serde_json::json!({"name": name, "parents": [parent]}))
+                })?;
                 if !response.status().is_success() {
                     return Err(failure(response));
                 }
@@ -147,29 +146,37 @@ impl Api {
                     && current.modified()?.duration_since(UNIX_EPOCH)?.as_nanos() == modified,
                 "local file changed during upload; rerun with a stable file"
             );
-            let mut request = self
-                .client
-                .put(url.clone())
-                .bearer_auth(&token)
-                .timeout(Duration::from_secs(180));
-            if probe || size == 0 || start == size {
-                request = request
-                    .header("Content-Range", format!("bytes */{size}"))
-                    .header("Content-Length", 0);
-            } else {
-                let count = (size - start).min(CHUNK);
+            let mut body = None;
+            let count = (size - start).min(CHUNK);
+            if !(probe || size == 0 || start == size) {
                 file.seek(SeekFrom::Start(start))?;
                 let mut bytes = vec![0; count as usize];
                 file.read_exact(&mut bytes)?;
-                request = request
-                    .header("Content-Type", "application/octet-stream")
-                    .header(
-                        "Content-Range",
-                        format!("bytes {}-{}/{size}", start, start + count - 1),
-                    )
-                    .body(bytes);
+                body = Some(bytes);
             }
-            let response = request.send();
+            let response = self.deliver(|client, forged| {
+                let mut request = client
+                    .put(crate::api::gate(forged, &url))
+                    .bearer_auth(&token)
+                    .timeout(Duration::from_secs(180));
+                match &body {
+                    None => {
+                        request = request
+                            .header("Content-Range", format!("bytes */{size}"))
+                            .header("Content-Length", 0);
+                    }
+                    Some(bytes) => {
+                        request = request
+                            .header("Content-Type", "application/octet-stream")
+                            .header(
+                                "Content-Range",
+                                format!("bytes {}-{}/{size}", start, start + count - 1),
+                            )
+                            .body(bytes.clone());
+                    }
+                }
+                request
+            });
             match response {
                 Ok(r) if r.status() == StatusCode::OK || r.status() == StatusCode::CREATED => {
                     let result: File = r.json()?;

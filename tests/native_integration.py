@@ -22,7 +22,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
-        requests.append((self.path, self.headers.get('Range'), self.headers.get('Authorization')))
+        requests.append((self.path, self.headers.get('Range'), self.headers.get('Authorization'), self.headers.get('Host')))
         if self.path == '/redirect':
             self.send_response(302)
             self.send_header('Location', 'https://example.com/steal')
@@ -104,7 +104,10 @@ int main(int n,char**v){
             cmd += ['-lws2_32','-lwsock32','-lgdi32','-lwinmm','-liphlpapi','-lpsapi','-lcrypt32','-lbcrypt','-ladvapi32']
         cmd += ['-o',str(tmp/'harness')]
         subprocess.run(cmd,check=True)
-        subprocess.run(['openssl','req','-x509','-newkey','rsa:2048','-nodes','-days','1','-subj','/CN=drive.usercontent.google.com','-addext','subjectAltName=DNS:drive.usercontent.google.com,DNS:www.googleapis.com','-keyout',str(tmp/'key.pem'),'-out',str(tmp/'cert.pem')],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        # The certificate covers both the real hosts and the forged identity:
+        # in forged mode gdirect connects and verifies as g.cn while Host: keeps
+        # the real hostname, so the fixture must certify all of them.
+        subprocess.run(['openssl','req','-x509','-newkey','rsa:2048','-nodes','-days','1','-subj','/CN=drive.usercontent.google.com','-addext','subjectAltName=DNS:drive.usercontent.google.com,DNS:www.googleapis.com,DNS:g.cn','-keyout',str(tmp/'key.pem'),'-out',str(tmp/'cert.pem')],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         server = http.server.ThreadingHTTPServer(('127.0.0.1',0), Handler)
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(tmp/'cert.pem',tmp/'key.pem')
@@ -121,17 +124,21 @@ int main(int n,char**v){
         try:
             run('split.bin'); check('split.bin')
             assert 'g.cn' in snis and any(r[1] for r in requests)
-            print('PASS: pinned IP, alternate SNI, original certificate identity, parallel ranges and byte integrity')
+            assert all(r[3] == 'drive.usercontent.google.com' for r in requests)
+            print('PASS: pinned IP, forged SNI identity, real Host header, parallel ranges and byte integrity')
             run('no-sni.bin',sni='');check('no-sni.bin');assert None in snis
             print('PASS: no-SNI with certificate verification')
-            run('mismatch.bin',host='drive.google.com',success=False)
+            # With no forged identity the certificate is checked against the
+            # URL's own hostname; the fixture cert does not cover drive.google.com.
+            run('mismatch.bin',host='drive.google.com',sni='',success=False)
             print('PASS: rejects wrong original hostname despite successful TLS transport')
             run('redirect.bin',path='/redirect',success=False)
             print('PASS: rejects non-Google redirects')
             requests.clear()
             run('media.bin',path='/media',host='www.googleapis.com',token='fixture-token');check('media.bin')
-            assert any(p=='/media' and t=='Bearer fixture-token' for p,_,t in requests)
-            assert all(t is None for p,_,t in requests if p=='/blob')
+            assert any(p=='/media' and t=='Bearer fixture-token' for p,_,t,_ in requests)
+            assert all(t is None for p,_,t,_ in requests if p=='/blob')
+            assert all(h == 'drive.usercontent.google.com' for p,_,_,h in requests if p == '/blob')
             print('PASS: OAuth token is stripped from media redirects')
             if sys.platform != 'win32':
                 p=subprocess.Popen(command('resume.bin',path='/slow'),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)

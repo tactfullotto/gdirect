@@ -25,25 +25,17 @@ struct Route {
     /// Connect to this Google IP instead of the best scanned one
     #[arg(long)]
     ip: Option<IpAddr>,
-}
-#[derive(Args, Clone, Default)]
-struct Transfer {
-    #[command(flatten)]
-    route: Route,
-    /// TLS SNI hostname to send instead of the original Google hostname
+    /// TLS identity hostname to use instead of the original Google hostname
+    /// (the Host header still carries the real Google hostname)
     #[arg(long)]
     sni: Option<String>,
-    /// Send no TLS SNI; the certificate is still verified
+    /// Send no TLS SNI (downloads only); the certificate is still verified
     #[arg(long, conflicts_with = "sni")]
     no_sni: bool,
-    /// CA bundle for certificate verification (default: bundled Google GTS roots)
-    #[arg(long)]
-    ca_cert: Option<PathBuf>,
-    /// Connections per download, 1-16 (default: value saved in browse, else 8)
-    #[arg(short = 'j', long, value_parser = clap::value_parser!(u8).range(1..=16))]
-    connections: Option<u8>,
 }
-impl Transfer {
+impl Route {
+    /// Explicit identity choice: Some(name) to forge, Some("") for no SNI,
+    /// None to follow the scanned route and allow automatic fallback.
     fn sni(&self) -> Option<String> {
         if self.no_sni {
             Some(String::new())
@@ -51,6 +43,17 @@ impl Transfer {
             self.sni.clone()
         }
     }
+}
+#[derive(Args, Clone, Default)]
+struct Transfer {
+    #[command(flatten)]
+    route: Route,
+    /// CA bundle for certificate verification (default: bundled Google GTS roots)
+    #[arg(long)]
+    ca_cert: Option<PathBuf>,
+    /// Connections per download, 1-16 (default: value saved in browse, else 8)
+    #[arg(short = 'j', long, value_parser = clap::value_parser!(u8).range(1..=16))]
+    connections: Option<u8>,
 }
 #[derive(Subcommand, Clone)]
 enum Commands {
@@ -142,14 +145,20 @@ enum Commands {
         transfer: Transfer,
     },
 }
-fn direct_ip(db: &store::Store, ip: Option<IpAddr>) -> Result<IpAddr> {
-    if let Some(ip) = ip {
-        return Ok(ip);
+/// Effective route: endpoint, TLS identity (None = real hostname) and whether
+/// an automatic identity fallback is allowed on transport failure.
+fn direct_route(db: &store::Store, route: &Route) -> Result<(IpAddr, Option<String>, bool)> {
+    let explicit = route.sni();
+    let auto = explicit.is_none();
+    if let Some(ip) = route.ip {
+        return Ok((ip, explicit, auto));
     }
-    match db.best_route()? {
-        Some(route) => Ok(route.ip),
-        None => Ok(scan::run(db, None)?.ip),
-    }
+    let scanned = match db.best_route()? {
+        Some(route) => route,
+        None => scan::run(db, None)?,
+    };
+    let stored = (!scanned.sni.is_empty()).then_some(scanned.sni);
+    Ok((scanned.ip, explicit.or(stored), auto))
 }
 fn run(cli: Cli) -> Result<()> {
     let db_path = cli.db.clone().map(Ok).unwrap_or_else(store::default_path)?;
@@ -171,7 +180,8 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Scan { list: true, .. } => {
             for e in db.endpoints()? {
                 match e.latency_ms {
-                    Some(ms) => println!("{}\tOK\t{ms} ms", e.ip),
+                    Some(ms) if e.sni.is_empty() => println!("{}\tOK\t{ms} ms", e.ip),
+                    Some(ms) => println!("{}\tOK\t{ms} ms (SNI {})", e.ip, e.sni),
                     None => println!("{}\tunavailable\t{}", e.ip, e.error.unwrap_or_default()),
                 }
             }
@@ -187,7 +197,7 @@ fn run(cli: Cli) -> Result<()> {
             foreground,
             connections,
         } => {
-            let api = api::Api::new(db_path, None)?;
+            let api = api::Api::new(db_path, None, None, false)?;
             let connections = connections.unwrap_or_else(saved);
             mount::run(&api, path.as_deref(), read_only, foreground, connections)?;
         }
@@ -196,7 +206,7 @@ fn run(cli: Cli) -> Result<()> {
             client_secret,
             credentials,
         } => {
-            let api = api::Api::new(db_path, None)?;
+            let api = api::Api::new(db_path, None, None, false)?;
             let email = api.login(reauth, client_secret.as_deref(), credentials.as_deref())?;
             println!("Logged in: {email}\nSQLite: {}", api.db.display());
             if !reauth && client_secret.is_none() && credentials.is_none() {
@@ -208,7 +218,8 @@ fn run(cli: Cli) -> Result<()> {
             json,
             route,
         } => {
-            let api = api::Api::new(db_path, Some(direct_ip(&db, route.ip)?))?;
+            let (ip, sni, auto) = direct_route(&db, &route)?;
+            let api = api::Api::new(db_path, Some(ip), sni, auto)?;
             let files = api.list(&folder)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&files)?);
@@ -230,7 +241,8 @@ fn run(cli: Cli) -> Result<()> {
             name,
             route,
         } => {
-            let api = api::Api::new(db_path, Some(direct_ip(&db, route.ip)?))?;
+            let (ip, sni, auto) = direct_route(&db, &route)?;
+            let api = api::Api::new(db_path, Some(ip), sni, auto)?;
             let uploaded = api.upload(&file, &parent, name.as_deref())?;
             println!("{}\t{}", uploaded.id, uploaded.name);
         }
@@ -240,23 +252,34 @@ fn run(cli: Cli) -> Result<()> {
             export,
             transfer,
         } => {
-            let ip = direct_ip(&db, transfer.route.ip)?;
-            let api = api::Api::new(db_path, Some(ip))?;
+            let (ip, sni, auto) = direct_route(&db, &transfer.route)?;
+            let api = api::Api::new(db_path, Some(ip), sni.clone(), auto)?;
             let connections = transfer.connections.unwrap_or_else(saved);
-            start_download(&api, &db, file, output, export, ip, &transfer, connections)?;
+            start_download(
+                &api,
+                file,
+                output,
+                export,
+                ip,
+                sni,
+                auto,
+                &transfer,
+                connections,
+            )?;
         }
         Commands::Browse {
             folder,
             output,
             transfer,
         } => {
-            let ip = direct_ip(&db, transfer.route.ip)?;
-            let api = api::Api::new(db_path, Some(ip))?;
+            let (ip, sni, auto) = direct_route(&db, &transfer.route)?;
+            let api = api::Api::new(db_path, Some(ip), sni.clone(), auto)?;
             let options = tui::Options {
                 folder,
                 output,
                 ip: Some(ip),
-                sni: transfer.sni(),
+                sni,
+                auto,
                 connections: transfer.connections.unwrap_or_else(saved),
                 ca_cert: transfer.ca_cert,
             };
@@ -281,14 +304,16 @@ fn logout(db: &store::Store) -> Result<()> {
 #[allow(clippy::too_many_arguments)]
 fn start_download(
     api: &api::Api,
-    db: &store::Store,
     file: String,
     output: Option<PathBuf>,
     export: Option<String>,
     ip: IpAddr,
+    sni: Option<String>,
+    auto: bool,
     transfer: &Transfer,
     connections: u8,
 ) -> Result<()> {
+    let db = store::Store::open(&api.db)?;
     let token = if db.account()?.is_some() || std::env::var_os("GDIRECT_ACCESS_TOKEN").is_some() {
         Some(api.download_token()?)
     } else {
@@ -327,7 +352,9 @@ fn start_download(
             file,
             output,
             ip: Some(ip),
-            sni: transfer.sni(),
+            sni,
+            auto,
+            db: Some(api.db.clone()),
             md5: metadata
                 .as_ref()
                 .filter(|_| export.is_none())
@@ -367,7 +394,7 @@ mod tests {
         assert!(parse(&["scan", "--list", "--db", "x.sqlite3"]).is_ok());
         assert!(parse(&["login", "--ip", "1.1.1.1"]).is_err());
         assert!(parse(&["scan", "-o", "x"]).is_err());
-        assert!(parse(&["ls", "--sni", "g.cn"]).is_err());
+        assert!(parse(&["ls", "--sni", "g.cn"]).is_ok());
         assert!(parse(&["upload", "f", "--ip", "1.1.1.1", "-j", "2"]).is_err());
         assert!(parse(&["mount", "--ip", "1.1.1.1"]).is_err());
         assert!(parse(&["mount", "-j", "4"]).is_ok());
@@ -380,6 +407,6 @@ mod tests {
         let Some(Commands::Download { transfer, .. }) = cli.command else {
             panic!()
         };
-        assert_eq!(transfer.sni().as_deref(), Some(""));
+        assert_eq!(transfer.route.sni().as_deref(), Some(""));
     }
 }

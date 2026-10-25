@@ -27,6 +27,7 @@ pub struct Options {
     pub output: PathBuf,
     pub ip: Option<IpAddr>,
     pub sni: Option<String>,
+    pub auto: bool,
     pub connections: u8,
     pub ca_cert: Option<PathBuf>,
 }
@@ -578,6 +579,8 @@ fn start(api: &Api, options: &Options, tx: &Sender<Message>, job: &Job, connecti
         output: job.output.clone(),
         ip: options.ip,
         sni: options.sni.clone(),
+        auto: options.auto,
+        db: Some(api.db.clone()),
         token: None,
         export: job.file.workspace().then(|| "application/pdf".into()),
         md5: job.file.md5_checksum.clone(),

@@ -21,6 +21,11 @@ pub struct Args {
     pub output: PathBuf,
     pub ip: Option<IpAddr>,
     pub sni: Option<String>,
+    /// Retry once under the other TLS identity when the connection fails
+    /// (only when the user did not pick --sni/--no-sni explicitly).
+    pub auto: bool,
+    /// State database used to mark a dead endpoint after both identities fail.
+    pub db: Option<PathBuf>,
     pub token: Option<String>,
     pub export: Option<String>,
     /// Drive's md5Checksum, when known, to verify the saved file.
@@ -92,8 +97,9 @@ fn download(
     args: &Args,
     url: &Url,
     token: Option<&str>,
+    sni: Option<&str>,
     progress: Option<&mut Progress>,
-) -> Result<()> {
+) -> Result<i32> {
     let output = std::path::absolute(&args.output)?;
     let parent = output.parent().context("output needs a parent directory")?;
     fs::create_dir_all(parent)?;
@@ -106,11 +112,7 @@ fn download(
     let dir = CString::new(parent.to_str().context("output must be UTF-8")?)?;
     let name = CString::new(name)?;
     let ip = CString::new(args.ip.map(|x| x.to_string()).unwrap_or_default())?;
-    let sni = args
-        .sni
-        .as_ref()
-        .map(|s| CString::new(s.as_str()))
-        .transpose()?;
+    let sni = sni.map(CString::new).transpose()?;
     let token = CString::new(token.unwrap_or_default())?;
     let ca_path = args.ca_cert.clone().or_else(bundled_ca);
     let ca = CString::new(
@@ -128,7 +130,7 @@ fn download(
     let _lock = SESSION
         .lock()
         .map_err(|_| anyhow::anyhow!("download session lock poisoned"))?;
-    let code = unsafe {
+    Ok(unsafe {
         gdirect_download_ex(
             url.as_ptr(),
             dir.as_ptr(),
@@ -146,13 +148,24 @@ fn download(
             data,
             signals,
         )
+    })
+}
+// TLS handshake, connect and DNS failures: exactly what the fallback route is for.
+fn transport(code: i32) -> bool {
+    matches!(code, 1 | 2 | 6 | 19)
+}
+fn mark_dead(args: &Args) {
+    let (Some(ip), Some(db)) = (args.ip, &args.db) else {
+        return;
     };
-    ensure!(
-        code == 0,
-        "download failed: {} (libaria2 code {code}); partial data is kept, rerun to resume",
-        aria2_error(code)
-    );
-    Ok(())
+    if let Ok(db) = crate::store::Store::open(db) {
+        let _ = db.endpoint(
+            &ip.to_string(),
+            None,
+            Some("download transport failure"),
+            "",
+        );
+    }
 }
 fn aria2_error(code: i32) -> &'static str {
     match code {
@@ -214,8 +227,39 @@ pub fn run(args: Args, progress: Option<&mut Progress>) -> Result<()> {
         );
     }
     let mut progress = progress;
+    let mut sni = args.sni.clone();
+    let mut tried_alt = false;
     for attempt in 0..3 {
-        download(&args, &url, token.as_deref(), progress.as_deref_mut())?;
+        let mut code = download(
+            &args,
+            &url,
+            token.as_deref(),
+            sni.as_deref(),
+            progress.as_deref_mut(),
+        )?;
+        if code != 0 && args.auto && !tried_alt && transport(code) {
+            tried_alt = true;
+            sni = match &sni {
+                Some(_) => None,
+                None => Some(crate::api::FORGED_HOST.to_owned()),
+            };
+            code = download(
+                &args,
+                &url,
+                token.as_deref(),
+                sni.as_deref(),
+                progress.as_deref_mut(),
+            )?;
+        }
+        if code != 0 {
+            if transport(code) {
+                mark_dead(&args);
+            }
+            bail!(
+                "download failed: {} (libaria2 code {code}); partial data is kept, rerun to resume",
+                aria2_error(code)
+            );
+        }
         let mut prefix = Vec::new();
         fs::File::open(&args.output)?
             .take(1024 * 1024)

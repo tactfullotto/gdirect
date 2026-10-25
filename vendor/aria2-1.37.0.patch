@@ -9,17 +9,18 @@
  #include "SocketCore.h"
  
  #ifdef HAVE_IPHLPAPI_H
-@@ -65,6 +67,9 @@
+@@ -65,6 +67,10 @@
  #ifdef HAVE_LIBSSH2
  #  include "SSHSession.h"
  #endif // HAVE_LIBSSH2
 +
 +const char* gdirect_ip = nullptr;
 +const char* gdirect_sni = nullptr;
++std::string gdirect_hosthdr;
  
  namespace aria2 {
  
-@@ -936,7 +941,9 @@
+@@ -936,7 +942,9 @@
      // "localhost" will produce TLS alert with GNUTLS.
      if (tlsctx->getSide() == TLS_CLIENT && !util::isNumericHost(hostname) &&
          hostname.find(".") != std::string::npos) {
@@ -30,11 +31,13 @@
        if (rv != TLS_ERR_OK) {
          throw DL_ABORT_EX(fmt(EX_SSL_INIT_FAILURE,
                                tlsSession_->getLastErrorString().c_str()));
-@@ -1450,6 +1457,10 @@
+@@ -1450,6 +1458,12 @@
    hints.ai_flags = getDefaultAIFlags();
    hints.ai_flags |= flags;
    hints.ai_protocol = protocol;
-+  if (host && gdirect_ip && *gdirect_ip && gdirect_host(host)) {
++  if (host && gdirect_ip && *gdirect_ip &&
++      (gdirect_host(host) ||
++       (gdirect_sni && *gdirect_sni && strcmp(host, gdirect_sni) == 0))) {
 +    host = gdirect_ip;
 +    hints.ai_flags |= AI_NUMERICHOST;
 +  }
@@ -52,16 +55,37 @@
  #include "Request.h"
  
  #include <cassert>
-@@ -150,7 +152,8 @@
+@@ -150,13 +152,24 @@
  {
    currentUri_ = removeFragment(srcUri);
    uri::UriStruct us;
 -  if (uri::parse(us, currentUri_)) {
-+  if (uri::parse(us, currentUri_) &&
-+      us.protocol == "https" && gdirect_host(us.host)) {
-     us_.swap(us);
-     return true;
+-    us_.swap(us);
+-    return true;
++  if (uri::parse(us, currentUri_) && us.protocol == "https") {
++    if (gdirect_sni && *gdirect_sni && gdirect_host(us.host)) {
++      // Forged identity: the connection, SNI and certificate name become
++      // gdirect_sni; the real host is kept only for the HTTP Host header.
++      gdirect_hosthdr = us.host;
++      us.host = gdirect_sni;
++      us_.swap(us);
++      return true;
++    }
++    // Real hosts pass through unchanged; a redirect relative to an already
++    // swapped URI lands on the forged host and keeps its Host header.
++    if (gdirect_host(us.host) ||
++        (gdirect_sni && *gdirect_sni && us.host == gdirect_sni)) {
++      us_.swap(us);
++      return true;
++    }
    }
+-  else {
+-    return false;
+-  }
++  return false;
+ }
+ 
+ void Request::resetRedirectCount() { redirectCount_ = 0; }
 --- a/src/HttpRequest.cc
 +++ b/src/HttpRequest.cc
 @@ -32,6 +32,8 @@
@@ -73,18 +97,30 @@
  #include "HttpRequest.h"
  
  #include <cassert>
-@@ -279,6 +281,8 @@
+@@ -190,7 +192,9 @@
+       builtinHds.emplace_back("Accept-Encoding:", acceptableEncodings);
+     }
+   }
+-  builtinHds.emplace_back("Host:", getHostText(getURIHost(), getPort()));
++  builtinHds.emplace_back("Host:", gdirect_hosthdr.empty()
++                                       ? getHostText(getURIHost(), getPort())
++                                       : gdirect_hosthdr);
+   if (noCache_) {
+     builtinHds.emplace_back("Pragma:", "no-cache");
+     builtinHds.emplace_back("Cache-Control:", "no-cache");
+@@ -279,6 +283,9 @@
    }
    // append additional headers given by user.
    for (const auto& hd : headers_) {
 +    if (util::istartsWith(hd, "Authorization:") &&
-+        getHost() != "www.googleapis.com") continue;
++        (gdirect_hosthdr.empty() ? getHost() : gdirect_hosthdr) !=
++            "www.googleapis.com") continue;
      requestLine += hd;
      requestLine += "\r\n";
    }
 --- a/src/Platform.cc
 +++ b/src/Platform.cc
-@@ -119,11 +119,15 @@
+@@ -119,12 +119,16 @@
  
  #ifdef HAVE_OPENSSL
  #  if OPENSSL_VERSION_NUMBER >= 0x30000000L
@@ -96,8 +132,9 @@
    if (!legacy_provider_) {
      throw DL_ABORT_EX("OSSL_PROVIDER_load 'legacy' failed.");
    }
-+
-+#    endif // ENABLE_BITTORRENT
  
++#    endif // ENABLE_BITTORRENT
++
    default_provider_ = OSSL_PROVIDER_load(nullptr, "default");
    if (!default_provider_) {
+     throw DL_ABORT_EX("OSSL_PROVIDER_load 'default' failed.");
