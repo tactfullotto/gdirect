@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Automatic forged-identity fallback on every pinned-IP path: when connections carrying the real Google SNI fail, requests retry under `g.cn` as TLS name with the real host kept in the HTTP Host header. The identity that works is stored per endpoint; `--sni`/`--no-sni` now apply to `ls` and `upload` too, and `--no-sni` remains download-only.
+- `scan` probes the forged identity when the real one fails and `scan --list` shows which identity each IP needed.
+
+### Changed
+
+- Google-bound TLS now verifies against Google's own GTS roots embedded in the binary instead of a full CA bundle, so a compromised or mis-issuing third-party CA can no longer impersonate Google for gdirect. The `cacert.pem` side file is gone; `--ca-cert` remains an explicit override.
+- A download that fails on the wire marks its endpoint dead, so the next command rescans instead of reusing a blocked IP for up to 24 hours.
+
 ## 0.4.0
 
 ### Added

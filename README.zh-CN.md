@@ -12,7 +12,7 @@ gdirect 是一个在终端里浏览、下载、上传和挂载 Google 云盘的�
 | 登录与刷新令牌（`oauth2.googleapis.com`） | 系统网络（系统 DNS、代理） |
 | `mount`（rclone） | 系统网络 |
 
-第一次运行传输类命令时会自动扫描候选 IP，并在 24 小时内沿用最快的可用 IP。`login` 和 `mount` 不扫描。
+第一次运行传输类命令时会自动扫描候选 IP，并在 24 小时内沿用最快的可用 IP。`login` 和 `mount` 不扫描。每个候选 IP 先用真实 SNI 探测，失败再试伪造身份，保存下来的路由始终反映实际能通的那条。证书只按内置的 Google GTS 根校验，不信任系统 CA 包——第三方 CA 被攻破也无法对 gdirect 冒充 Google。
 
 网络要求：
 

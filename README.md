@@ -8,11 +8,11 @@ gdirect browses, downloads, uploads and mounts your Google Drive from the termin
 
 | Traffic | Route |
 | --- | --- |
-| Drive API, downloads, uploads (`browse`, `ls`, `download`, `upload`) | A scanned Google IP. The hostname and certificate check stay the same; the TLS SNI can be changed with `--sni` / `--no-sni` |
+| Drive API, downloads, uploads (`browse`, `ls`, `download`, `upload`) | A scanned Google IP. The hostname and certificate check stay the same. If connections carrying the real SNI are reset, gdirect automatically retries under a forged identity (`g.cn` as TLS name, the real host in the Host header) — same idea as Sheas-Cealer — and remembers what worked per IP |
 | Sign-in and token refresh (`oauth2.googleapis.com`) | Your normal system network (DNS, proxy) |
 | `mount` (rclone) | Your normal system network |
 
-The first transfer command scans candidate IPs automatically and keeps the fastest working one for 24 hours. `login` and `mount` do not scan.
+The first transfer command scans candidate IPs automatically and keeps the fastest working one for 24 hours. `login` and `mount` do not scan. Each candidate is probed with the real SNI first, then with the forged identity, so the stored route always reflects what actually connects. Certificates are verified against Google's own GTS roots (embedded in the binary), never against a system CA bundle — a compromised third-party CA cannot impersonate Google for gdirect.
 
 Network requirements:
 
@@ -107,12 +107,12 @@ gdirect upload ./file.zip --parent FOLDER_ID --name backup.zip
 - **Uploads** always create a new file. They never overwrite a file with the same name.
 - **Connections:** `-j N` sets the number of connections for one command only. The saved default (8 at first) changes only with `+/-` in `browse`.
 
-Advanced transfer options for `download` and `browse` (`ls` and `upload` accept `--ip` only):
+Advanced route options (`download` and `browse` take all of them; `ls` and `upload` accept `--ip` and `--sni`):
 
 | Option | Meaning |
 | --- | --- |
 | `--ip IP` | Use this Google IP instead of the scanned one |
-| `--sni HOST` / `--no-sni` | Send a different TLS SNI, or none. Certificates are still checked against the real hostname |
+| `--sni HOST` / `--no-sni` | Force a forged TLS identity (Host header stays real), or send no SNI. Without them gdirect uses the scanned identity and falls back automatically. `--no-sni` applies to downloads only |
 | `--ca-cert FILE` | Use this CA bundle instead of the embedded Google GTS roots |
 | `--export MIME` | (`download`) Export a Google Docs file, for example `application/pdf` |
 
