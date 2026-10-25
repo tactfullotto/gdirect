@@ -21,13 +21,12 @@ pub(crate) const FORGED_HOST: &str = "g.cn";
 pub(crate) const GTS_PEM: &str = include_str!("gts-roots.pem");
 pub(crate) fn client_builder() -> reqwest::blocking::ClientBuilder {
     let mut builder = Client::builder().tls_built_in_root_certs(false);
-    for pem in GTS_PEM.split("-----END CERTIFICATE-----") {
-        let pem = pem.trim();
-        if pem.is_empty() {
-            continue;
-        }
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+    for block in GTS_PEM.split(BEGIN).skip(1) {
+        let end = block.find(END).expect("bundled GTS root must be complete") + END.len();
         builder = builder.add_root_certificate(
-            reqwest::Certificate::from_pem(format!("{pem}-----END CERTIFICATE-----").as_bytes())
+            reqwest::Certificate::from_pem(format!("{BEGIN}{}", &block[..end]).as_bytes())
                 .expect("bundled GTS root must parse"),
         );
     }

@@ -74,18 +74,30 @@ fn candidates(db: &Store, path: Option<&Path>) -> Result<Vec<IpAddr>> {
     Ok(ips.into_iter().collect())
 }
 // A missing or changed public test file is reported as a warning, not as a dead IP.
-fn probe(ip: IpAddr) -> Result<(i64, Option<String>)> {
+//
+// `forged` selects the fallback identity: the URL (and therefore SNI and
+// certificate name) is g.cn while the Host header still carries the real
+// Google host. Google's front end routes by Host, so the same probes work.
+fn probe(ip: IpAddr, forged: bool) -> Result<(i64, Option<String>)> {
+    use crate::api::{API_HOST, FORGED_HOST};
+    const FILE_HOST: &str = "drive.usercontent.google.com";
+    let (api_url, file_url) = if forged {
+        (FORGED_HOST, FORGED_HOST)
+    } else {
+        (API_HOST, FILE_HOST)
+    };
     let client = crate::api::client_builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(3))
         .timeout(Duration::from_secs(5))
-        .resolve("www.googleapis.com", SocketAddr::new(ip, 443))
-        .resolve("drive.usercontent.google.com", SocketAddr::new(ip, 443))
+        .resolve(api_url, SocketAddr::new(ip, 443))
+        .resolve(file_url, SocketAddr::new(ip, 443))
         .build()?;
     let start = Instant::now();
     let response = client
-        .get("https://www.googleapis.com/drive/v3/about?fields=user")
+        .get(format!("https://{api_url}/drive/v3/about?fields=user"))
+        .header(reqwest::header::HOST, API_HOST)
         .send()
         .map_err(|e| e.without_url())?;
     ensure!(
@@ -95,7 +107,13 @@ fn probe(ip: IpAddr) -> Result<(i64, Option<String>)> {
     );
     let data: serde_json::Value = response.json()?;
     ensure!(data["error"]["code"] == 401, "invalid Drive API response");
-    let response=client.get("https://drive.usercontent.google.com/download?id=0B9P1L--7Wd2vU3VUVlFnbTgtS2c&export=download&confirm=t").send().map_err(|e|e.without_url())?;
+    let response = client
+        .get(format!(
+            "https://{file_url}/download?id=0B9P1L--7Wd2vU3VUVlFnbTgtS2c&export=download&confirm=t"
+        ))
+        .header(reqwest::header::HOST, FILE_HOST)
+        .send()
+        .map_err(|e| e.without_url())?;
     let status = response.status();
     let warning = if matches!(
         status,
@@ -129,20 +147,28 @@ pub fn run(db: &Store, path: Option<&Path>) -> Result<crate::store::Route> {
                     let Some(ip) = next else {
                         break;
                     };
-                    let result = probe(ip).map_err(|e| format!("{e:#}"));
-                    let _ = tx.send((ip, result));
+                    // The real SNI is tried first; a forged identity gets a
+                    // chance only when the real one cannot complete a probe.
+                    let (result, sni) = match probe(ip, false) {
+                        Ok(ok) => (Ok(ok), ""),
+                        Err(real) => match probe(ip, true) {
+                            Ok(ok) => (Ok(ok), crate::api::FORGED_HOST),
+                            Err(forged) => (Err(format!("{real:#} | forged: {forged:#}")), ""),
+                        },
+                    };
+                    let _ = tx.send((ip, result, sni));
                 }
             });
         }
         drop(tx);
         let mut results = Vec::new();
-        for (ip, result) in rx {
-            results.push((ip, result));
+        for (ip, result, sni) in rx {
+            results.push((ip, result, sni));
         }
         results
     })
     .into_iter()
-    .try_for_each(|(ip, result)| -> Result<()> {
+    .try_for_each(|(ip, result, sni)| -> Result<()> {
         match result {
             Ok((ms, problem)) => {
                 if let Some(problem) = problem
@@ -153,8 +179,12 @@ pub fn run(db: &Store, path: Option<&Path>) -> Result<crate::store::Route> {
                     );
                     warned = true;
                 }
-                db.endpoint(&ip.to_string(), Some(ms), None, "")?;
-                eprintln!("  OK  {ip}  {ms} ms");
+                db.endpoint(&ip.to_string(), Some(ms), None, sni)?;
+                if sni.is_empty() {
+                    eprintln!("  OK  {ip}  {ms} ms");
+                } else {
+                    eprintln!("  OK  {ip}  {ms} ms (SNI {sni})");
+                }
             }
             Err(error) => {
                 db.endpoint(&ip.to_string(), None, Some(&error), "")?;
