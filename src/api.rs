@@ -266,7 +266,8 @@ impl Api {
     }
     /// Refreshes over the pinned endpoint so transfers need no proxy for
     /// OAuth either; without one, or when it does not answer as Google's
-    /// token endpoint, falls back to the system-proxy route.
+    /// token endpoint, falls back to the configured auth proxy (--proxy /
+    /// GDIRECT_PROXY) and otherwise to the system-proxy route.
     fn refresh_pinned(&self, credentials: &crate::auth::Credentials) -> Result<crate::auth::Token> {
         if self.route().0.is_some() {
             let form = credentials.refresh_form();
@@ -286,19 +287,54 @@ impl Api {
                 return crate::auth::refreshed(status, &data);
             }
         }
-        crate::auth::refresh(credentials)
+        crate::auth::refresh(credentials, self.auth_proxy().as_deref())
+    }
+    /// Proxy for sign-in and for token refresh when the pinned route fails:
+    /// `GDIRECT_PROXY` first (`none`/`direct`/empty disables), then the URL
+    /// saved by `--proxy`. Drive API, uploads, downloads and scans never use it.
+    pub fn auth_proxy(&self) -> Option<String> {
+        if let Ok(env) = std::env::var("GDIRECT_PROXY") {
+            let env = env.trim();
+            return (!matches!(env, "" | "none" | "direct")).then(|| env.to_owned());
+        }
+        Store::open(&self.db)
+            .ok()?
+            .setting("proxy")
+            .ok()
+            .flatten()
+            .filter(|s| !s.trim().is_empty())
     }
     fn account_for_token(&self, token: &str) -> Result<String> {
-        let response = self
-            .deliver(|client, forged| {
-                client
-                    .get(url_for(forged, "drive/v3/about"))
-                    .query(&[("fields", "user(emailAddress)")])
-                    .bearer_auth(token)
-            })
-            .context(
-                "cannot verify the account; check system HTTP/HTTPS proxy settings or HTTPS_PROXY and access to www.googleapis.com",
-            )?;
+        let request = |client: &Client, forged: Option<&str>| {
+            client
+                .get(url_for(forged, "drive/v3/about"))
+                .query(&[("fields", "user(emailAddress)")])
+                .bearer_auth(token)
+        };
+        // Unpinned (sign-in) with an explicit auth proxy: verify through it.
+        let proxied = match (self.route().0, self.auth_proxy()) {
+            (None, Some(url)) => Some(
+                client_builder()
+                    .no_proxy()
+                    .proxy(reqwest::Proxy::all(url.trim()).context("invalid auth proxy URL")?)
+                    .redirect(reqwest::redirect::Policy::none())
+                    .connect_timeout(Duration::from_secs(15))
+                    .timeout(Duration::from_secs(30))
+                    .build()?,
+            ),
+            _ => None,
+        };
+        let response = match &proxied {
+            Some(client) => request(client, None)
+                .send()
+                .map_err(|e| anyhow::anyhow!(e.without_url())),
+            None => self
+                .deliver(|client, forged| request(client, forged))
+                .map_err(Into::into),
+        }
+        .context(
+            "cannot verify the account; check --proxy, system HTTP/HTTPS proxy settings or HTTPS_PROXY and access to www.googleapis.com",
+        )?;
         let data = checked(response)?;
         Ok(data["user"]["emailAddress"]
             .as_str()
@@ -312,9 +348,16 @@ impl Api {
         import: Option<&Path>,
     ) -> Result<String> {
         let db = Store::open(&self.db)?;
-        let credentials =
-            crate::auth::prepare_login(&db, self.account.as_deref(), client, import, reauth)?;
-        let token = crate::auth::refresh(&credentials)?;
+        let proxy = self.auth_proxy();
+        let credentials = crate::auth::prepare_login(
+            &db,
+            self.account.as_deref(),
+            client,
+            import,
+            reauth,
+            proxy.as_deref(),
+        )?;
+        let token = crate::auth::refresh(&credentials, proxy.as_deref())?;
         // Whichever account was chosen in the browser is added (or updated) and becomes the default.
         let email = self.account_for_token(&token.access_token)?;
         db.save_account(&email, &serde_json::to_string(&credentials)?)?;

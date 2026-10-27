@@ -34,6 +34,12 @@ struct Cli {
         value_parser = clap::builder::BoolishValueParser::new()
     )]
     google_only: bool,
+    /// Proxy for sign-in and for token refresh when the direct route via the
+    /// scanned Google IP fails: socks5://, socks5h://, http:// or https:// URL.
+    /// Saved in the database; `none` clears it. Never used for Drive API,
+    /// uploads, downloads or scans.
+    #[arg(long, global = true)]
+    proxy: Option<String>,
 }
 #[derive(Args, Clone, Default)]
 struct Route {
@@ -221,6 +227,17 @@ fn direct_route(db: &store::Store, route: &Route, google_only: bool) -> Result<D
 fn run(cli: Cli) -> Result<()> {
     let db_path = cli.db.clone().map(Ok).unwrap_or_else(store::default_path)?;
     let db = store::Store::open(&db_path)?;
+    if let Some(raw) = &cli.proxy {
+        let url = raw.trim();
+        if matches!(url, "" | "none" | "direct") {
+            db.unset("proxy")?;
+        } else {
+            reqwest::Proxy::all(url).context(
+                "invalid --proxy URL (e.g. socks5h://127.0.0.1:7891 or http://127.0.0.1:7890)",
+            )?;
+            db.set("proxy", url)?;
+        }
+    }
     // Commands that work without a login resolve the account lazily.
     let account = || db.resolve_account(cli.account.as_deref());
     let saved = || -> u8 {

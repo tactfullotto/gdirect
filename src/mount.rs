@@ -72,7 +72,7 @@ pub fn run(
     );
     let credentials_data = crate::auth::credentials(&db, Some(&account))?;
     // Fail here rather than inside rclone if the saved login no longer works.
-    crate::auth::refresh(&credentials_data)?;
+    crate::auth::refresh(&credentials_data, api.auth_proxy().as_deref())?;
     let email = account.as_str();
     let path = path
         .map(Path::to_path_buf)

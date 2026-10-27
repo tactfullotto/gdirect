@@ -78,15 +78,26 @@ pub struct Token {
     pub access_token: String,
     pub expires_in: i64,
 }
-fn http() -> Result<reqwest::blocking::Client> {
-    Ok(crate::api::client_builder()
+/// An explicit auth proxy (socks5/socks5h/http/https URL) replaces the system
+/// proxy settings; without one the system settings apply as before.
+fn http(proxy: Option<&str>) -> Result<reqwest::blocking::Client> {
+    let mut builder = crate::api::client_builder()
         .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(45))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?)
+        .redirect(reqwest::redirect::Policy::none());
+    if let Some(url) = proxy.map(str::trim).filter(|s| !s.is_empty()) {
+        builder = builder
+            .no_proxy()
+            .proxy(reqwest::Proxy::all(url).context("invalid auth proxy URL")?);
+    }
+    Ok(builder.build()?)
 }
-fn post_token(endpoint: &str, form: &[(&str, &str)]) -> Result<(StatusCode, Value)> {
-    let response = http()?.post(endpoint).form(form).send().map_err(|e| {
+fn post_token(
+    endpoint: &str,
+    form: &[(&str, &str)],
+    proxy: Option<&str>,
+) -> Result<(StatusCode, Value)> {
+    let response = http(proxy)?.post(endpoint).form(form).send().map_err(|e| {
         anyhow::anyhow!(
             "cannot reach Google's token endpoint ({}); check system HTTP/HTTPS proxy settings or HTTPS_PROXY and access to oauth2.googleapis.com",
             e.without_url()
@@ -127,8 +138,8 @@ pub(crate) fn refreshed(status: StatusCode, data: &Value) -> Result<Token> {
         expires_in: data["expires_in"].as_i64().unwrap_or(3600),
     })
 }
-pub fn refresh(credentials: &Credentials) -> Result<Token> {
-    let (status, data) = post_token(TOKEN_URI, &credentials.refresh_form())?;
+pub fn refresh(credentials: &Credentials, proxy: Option<&str>) -> Result<Token> {
+    let (status, data) = post_token(TOKEN_URI, &credentials.refresh_form(), proxy)?;
     refreshed(status, &data)
 }
 pub fn prepare_login(
@@ -137,6 +148,7 @@ pub fn prepare_login(
     client: Option<&Path>,
     import: Option<&Path>,
     reauth: bool,
+    proxy: Option<&str>,
 ) -> Result<Credentials> {
     if let Some(path) = import {
         return Credentials::parse(&fs::read(path).context("cannot read credentials JSON")?);
@@ -150,7 +162,7 @@ pub fn prepare_login(
         );
         let client = serde_json::from_value(data["installed"].clone())
             .context("OAuth client JSON is missing client_id")?;
-        return browser_login(&client);
+        return browser_login(&client, proxy);
     }
     if reauth {
         // Any signed-in account's client works for adding another account.
@@ -158,7 +170,7 @@ pub fn prepare_login(
             Some(raw) => serde_json::from_str(&raw)?,
             None => credentials(db, account.or(db.default_account()?.as_deref()))?.client(),
         };
-        return browser_login(&client);
+        return browser_login(&client, proxy);
     }
     credentials(db, account)
 }
@@ -190,7 +202,7 @@ fn callback(target: &str, state: &str) -> Result<Option<String>> {
             .clone(),
     ))
 }
-fn browser_login(client: &Client) -> Result<Credentials> {
+fn browser_login(client: &Client, proxy: Option<&str>) -> Result<Credentials> {
     let client_id = client.client_id.as_str();
     ensure!(
         client_id.ends_with(".apps.googleusercontent.com"),
@@ -290,6 +302,7 @@ fn browser_login(client: &Client) -> Result<Credentials> {
             ("redirect_uri", redirect.as_str()),
             ("grant_type", "authorization_code"),
         ],
+        proxy,
     )?;
     ensure!(
         status.is_success(),
@@ -329,7 +342,7 @@ mod tests {
     #[test]
     fn token_exchange_uses_proxy() {
         crate::test_network::assert_route("auth::tests::token_exchange_uses_proxy", true, |url| {
-            let (status, data) = post_token(url, &[("grant_type", "refresh_token")])?;
+            let (status, data) = post_token(url, &[("grant_type", "refresh_token")], None)?;
             ensure!(status.is_success(), "fixture token request failed");
             Ok(data)
         });
@@ -378,6 +391,15 @@ mod tests {
             )
             .is_err()
         );
+    }
+    #[test]
+    fn auth_proxy_accepts_socks_and_http_and_rejects_garbage() {
+        assert!(http(None).is_ok());
+        assert!(http(Some("")).is_ok());
+        assert!(http(Some("http://127.0.0.1:7890")).is_ok());
+        assert!(http(Some("socks5://127.0.0.1:7891")).is_ok());
+        assert!(http(Some("socks5h://u:p@127.0.0.1:7891")).is_ok());
+        assert!(http(Some("://bad")).is_err());
     }
     #[test]
     fn only_google_token_replies_count() {
